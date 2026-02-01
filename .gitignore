@@ -1,14 +1,307 @@
-# A fast, small, safe, gradually typed embeddable scripting language derived from Lua
-#
-# https://github.com/luau-lang/luau
-# https://luau.org/
+local InventoryManager = {}
 
-# Code coverage
-coverage.out
+--// SERVICES //--
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local DataStoreService = game:GetService("DataStoreService")
 
-# Profiling
-profile.out
-profile.svg
+--// VARIABLES //--
+local MarketplaceFolder = ReplicatedStorage.Marketplace
 
-# Time trace
-trace.json
+local EquipSurvivorRemote = MarketplaceFolder:WaitForChild("EquipSurvivor")
+local ReloadCharactersRemote = MarketplaceFolder:WaitForChild("ReloadCharacters")
+
+local DefaultCharacter = require(MarketplaceFolder.MarketplaceItems.Survivors.John)
+
+--// DATASTORE //--
+local InventoryStore = DataStoreService:GetDataStore("PlayerInventory")
+
+--// INVENTORY STORAGE //--
+-- PlayerInventories[userId] = {
+--     ["John"] = { Owned = true, Equipped = true },
+--     ["Jane"] = { Owned = true, Equipped = false },
+-- }
+
+local PlayerInventories = {}
+
+--// FUNCTIONS //--
+local function GetItemCategory(itemName)
+	for _, category in ipairs({"Survivors", "Killers", "Bundles", "Skins"}) do
+		local categoryFolder = MarketplaceFolder.MarketplaceItems:FindFirstChild(category)
+		if categoryFolder and categoryFolder:FindFirstChild(itemName) then
+			return category
+		end
+	end
+	
+	return "Misc" -- fallback
+end
+
+local function EnsureCategoryFolders(parentFolder)
+	for _, category in ipairs({"Survivors", "Killers", "Bundles", "Skins"}) do
+		if not parentFolder:FindFirstChild(category) then
+			local sub = Instance.new("Folder")
+			sub.Name = category
+			sub.Parent = parentFolder
+		end
+	end
+end
+
+local function UnequipAllItems(Player)
+	local userId = Player.UserId
+	local inv = PlayerInventories[userId]
+	if not inv then return end
+
+	for itemName, data in pairs(inv) do
+		if type(data) == "table" then
+			data.Equipped = false
+		else
+			--
+			inv[itemName] = { Owned = true, Equipped = false }
+		end
+
+		-- update folder value if exists
+		local folder = Player:FindFirstChild("Inventory")
+		if folder then
+			local itemVal = folder:FindFirstChild(itemName)
+			if itemVal and itemVal:FindFirstChild("Equipped") then
+				itemVal.Equipped.Value = false
+			end
+		end
+	end
+end
+
+function InventoryManager.LoadInventory(Player)
+	local userId = Player.UserId
+	local invData = {}
+	local isNewPlayer = false
+
+	local success, data = pcall(function()
+		return InventoryStore:GetAsync(tostring(userId))
+	end)
+
+	if success and data then
+		invData = data
+	else
+		isNewPlayer = true
+	end
+
+	for itemName, itemData in pairs(invData) do
+		if type(itemData) == "boolean" then
+			invData[itemName] = { Owned = true, Equipped = false }
+		end
+	end
+
+	PlayerInventories[userId] = invData
+
+	--
+	local folder = Player:FindFirstChild("Inventory")
+	if not folder then
+		folder = Instance.new("Folder")
+		folder.Name = "Inventory"
+		folder.Parent = Player
+	end
+
+	--
+	EnsureCategoryFolders(folder)
+	
+	--
+	for itemName, itemData in pairs(invData) do
+		local category = GetItemCategory(itemName)
+		local categoryFolder = folder:FindFirstChild(category) or folder
+
+		local itemFolder = Instance.new("Folder")
+		itemFolder.Name = itemName
+		itemFolder.Parent = categoryFolder
+
+		local ownedVal = Instance.new("BoolValue")
+		ownedVal.Name = "Owned"
+		ownedVal.Value = itemData.Owned or false
+		ownedVal.Parent = itemFolder
+
+		local equippedVal = Instance.new("BoolValue")
+		equippedVal.Name = "Equipped"
+		equippedVal.Value = itemData.Equipped or false
+		equippedVal.Parent = itemFolder
+
+		local tradableVal = Instance.new("BoolValue")
+		tradableVal.Name = "Tradable"
+		tradableVal.Value = itemData.Tradable or false
+		tradableVal.Parent = itemFolder
+	end
+
+	return isNewPlayer
+end
+
+function InventoryManager.SaveInventory(Player)
+	local userId = Player.UserId
+	local data = PlayerInventories[userId] or {}
+
+	local success, err = pcall(function()
+		InventoryStore:SetAsync(tostring(userId), data)
+	end)
+
+	if not success then
+		warn("Failed to save inventory for " .. Player.Name .. ": " .. err)
+	end
+end
+
+function InventoryManager.AddItem(Player, itemName, shouldEquip)
+	local userId = Player.UserId
+	local inv = PlayerInventories[userId] or {}
+
+	--
+	local category = GetItemCategory(itemName)
+	local itemModule = MarketplaceFolder.MarketplaceItems:FindFirstChild(category)
+	local itemData = nil
+	if itemModule then
+		local moduleScript = itemModule:FindFirstChild(itemName)
+		if moduleScript then
+			itemData = require(moduleScript)
+		end
+	end
+	local tradable = itemData and itemData.Tradable or false
+
+	--
+	if shouldEquip then
+		UnequipAllItems(Player)
+	end
+
+	-- Store in inventory
+	inv[itemName] = {
+		Owned = true,
+		Equipped = shouldEquip or false,
+		Tradable = tradable
+	}
+	PlayerInventories[userId] = inv
+
+	-- Update
+	local folder = Player:FindFirstChild("Inventory")
+	if folder then
+		EnsureCategoryFolders(folder)
+
+		local categoryFolder = folder:FindFirstChild(category) or folder
+
+		local itemFolder = categoryFolder:FindFirstChild(itemName)
+		if not itemFolder then
+			itemFolder = Instance.new("Folder")
+			itemFolder.Name = itemName
+			itemFolder.Parent = categoryFolder
+		end
+
+		local ownedVal = itemFolder:FindFirstChild("Owned") or Instance.new("BoolValue")
+		ownedVal.Name = "Owned"
+		ownedVal.Value = true
+		ownedVal.Parent = itemFolder
+
+		local equippedVal = itemFolder:FindFirstChild("Equipped") or Instance.new("BoolValue")
+		equippedVal.Name = "Equipped"
+		equippedVal.Value = shouldEquip or false
+		equippedVal.Parent = itemFolder
+
+		--
+		local tradableVal = itemFolder:FindFirstChild("Tradable") or Instance.new("BoolValue")
+		tradableVal.Name = "Tradable"
+		tradableVal.Value = tradable
+		tradableVal.Parent = itemFolder
+	end
+
+	-- Fire client to refresh
+	ReloadCharactersRemote:FireClient(Player)
+
+	InventoryManager.SaveInventory(Player)
+end
+
+function InventoryManager.RemoveItem(Player, itemName)
+	local userId = Player.UserId
+	local inv = PlayerInventories[userId]
+	if not inv or not inv[itemName] then return false end
+
+	inv[itemName] = nil
+
+	local folder = Player:FindFirstChild("Inventory")
+	if folder then
+		for _, subFolder in ipairs(folder:GetChildren()) do
+			if subFolder:IsA("Folder") then
+				local itemVal = subFolder:FindFirstChild(itemName)
+				if itemVal then
+					itemVal:Destroy()
+					
+					break
+				end
+			end
+		end
+	end
+
+	InventoryManager.SaveInventory(Player)
+	return true
+end
+
+function InventoryManager.GetInventory(playerOrId)
+	local userId = typeof(playerOrId) == "Instance" and playerOrId.UserId or playerOrId
+	return PlayerInventories[userId] or {}
+end
+
+function InventoryManager.GetEquippedSurvivor(Player)
+	local inv = PlayerInventories[Player.UserId]
+	if not inv then return nil end
+	
+	for itemName, data in pairs(inv) do
+		if data.Owned and data.Equipped then
+			return itemName
+		end
+	end
+end
+
+function InventoryManager.EquipItem(Player, itemName)
+	local userId = Player.UserId
+	local inv = PlayerInventories[userId]
+	if not inv or not inv[itemName] then return end
+
+	-- Unequip everything first
+	UnequipAllItems(Player)
+	
+	-- Equip
+	inv[itemName].Equipped = true
+
+	-- Update folder
+	local folder = Player:FindFirstChild("Inventory")
+	if folder then
+		for _, subFolder in ipairs(folder:GetChildren()) do
+			if subFolder:IsA("Folder") then
+				local itemVal = subFolder:FindFirstChild(itemName)
+				if itemVal and itemVal:FindFirstChild("Equipped") then
+					itemVal.Equipped.Value = true
+					break
+				end
+			end
+		end
+	end
+
+	InventoryManager.SaveInventory(Player)
+end
+
+--// PLAYER CONNECTIONS //--
+Players.PlayerAdded:Connect(function(Player)
+	InventoryManager.LoadInventory(Player)
+
+	-- Give default only if new (no inventory)
+	local inv = PlayerInventories[Player.UserId]
+	if not inv or not next(inv) then
+		InventoryManager.AddItem(Player, DefaultCharacter.Name, true)
+	end
+end)
+
+Players.PlayerRemoving:Connect(function(Player)
+	InventoryManager.SaveInventory(Player)
+	PlayerInventories[Player.UserId] = nil
+end)
+
+--// REMOTE //--
+MarketplaceFolder.GetInventory.OnServerInvoke = InventoryManager.GetInventory
+MarketplaceFolder.GetEquippedSurvivor.OnServerInvoke = InventoryManager.GetEquippedSurvivor
+
+EquipSurvivorRemote.OnServerEvent:Connect(function(Player, survivorName)
+	InventoryManager.EquipItem(Player, survivorName)
+end)
+
+return InventoryManager
